@@ -1,0 +1,10 @@
+# udap:meta cloud=aws region=us-east-1 target=ec2
+
+user: User { shape: person; udap-type: generic.user }
+vpc: VPC {
+  ec2: combinerail9 (Rust/Actix-Web) { shape: rectangle; udap-type: aws.ec2 }
+}
+sg: Security Group (HTTP 80 + SSH 22) { shape: rectangle; udap-type: generic.app }
+
+user -> vpc.ec2: HTTP :80
+sg -> vpc.ec2: enforces

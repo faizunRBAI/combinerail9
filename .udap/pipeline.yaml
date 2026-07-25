@@ -1,0 +1,143 @@
+version: 1
+name: combinerail9
+vcs: github
+
+stages:
+  - id: lint
+    kind: lint
+    needs: []
+    timeout_minutes: 10
+    steps:
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run Clippy
+        run: cargo clippy -- -D warnings
+
+  - id: test
+    kind: test
+    needs: [lint]
+    timeout_minutes: 15
+    steps:
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run tests
+        run: cargo test --verbose
+
+  - id: build
+    kind: build
+    needs: [test]
+    timeout_minutes: 20
+    steps:
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: combinerail9-binary
+          path: target/release/combinerail9
+          retention-days: 1
+
+  - id: provision
+    kind: provision
+    needs: [build]
+    timeout_minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+    steps:
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        run: >
+          terraform init -input=false -reconfigure
+          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
+          -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+          -backend-config="region=us-east-1"
+        working-directory: infra
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve
+        working-directory: infra
+      - id: tf_outputs
+        name: Get instance IP
+        run: echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
+        working-directory: infra
+    outputs:
+      instance_ip: ${{ steps.tf_outputs.outputs.instance_ip }}
+
+  - id: configure
+    kind: configure
+    needs: [provision]
+    timeout_minutes: 30
+    steps:
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: combinerail9-binary
+          path: artifact/
+      - name: Install Ansible
+        run: pip install ansible-core
+      - name: Write SSH key
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+      - name: Scan host key
+        run: ssh-keyscan -H "${{ needs.provision.outputs.instance_ip }}" >> ~/.ssh/known_hosts
+      - name: Generate inventory
+        run: |
+          printf '[app]\n%s ansible_user=%s ansible_ssh_private_key_file=~/.ssh/deploy_key\n' \
+            "${{ needs.provision.outputs.instance_ip }}" \
+            "${{ secrets.SSH_USER }}" > ansible/inventory.ini
+      - name: Run Ansible playbook
+        run: ansible-playbook -i ansible/inventory.ini ansible/site.yml
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+
+  - id: verify
+    kind: verify
+    needs: [provision, configure]
+    timeout_minutes: 10
+    steps:
+      - name: Setup Terraform (re-read outputs)
+        uses: hashicorp/setup-terraform@v3
+      - name: Terraform Init
+        run: >
+          terraform init -input=false -reconfigure
+          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}"
+          -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+          -backend-config="region=us-east-1"
+        working-directory: infra
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+          TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+      - name: Get instance IP
+        id: get_ip
+        run: echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
+        working-directory: infra
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+          TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+      - name: Health check
+        run: >
+          curl --fail --retry 12 --retry-delay 10 --retry-all-errors
+          http://${{ steps.get_ip.outputs.instance_ip }}/health
+
+rollback:
+  strategy: manual
